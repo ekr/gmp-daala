@@ -65,7 +65,7 @@
 // TODO(ekr@rtfm.com): Fix this
 #define Error(x)
 
-static int g_log_level = 0;
+static int g_log_level = 1;
 
 #define GMPLOG(l, x) do { \
         if (l <= g_log_level) { \
@@ -124,7 +124,8 @@ class DaalaVideoEncoder : public GMPVideoEncoder {
     host_ (hostAPI),
     worker_thread_ (NULL),
     callback_ (NULL),
-    enc_ctx_(NULL) {
+    enc_ctx_(NULL),
+    packet_number_(0) {
   }
 
   virtual void InitEncode (const GMPVideoCodec& codecSettings,
@@ -254,13 +255,18 @@ class DaalaVideoEncoder : public GMPVideoEncoder {
       GMPLOG(GL_DEBUG, "Packet size " << op.bytes);
 
       // TODO(ekr@rtfm.com): Check bytes in-range
-      size_t len = op.bytes + 5;
+      size_t len = op.bytes + 9;
       uint8_t* data = new uint8_t[len];
       uint32_t* lp = reinterpret_cast<uint32_t*>(data);
-      *lp = op.bytes + 1;  // include NAL type
+      *lp = op.bytes + 5;  // include NAL type
       // daala_packet_iskeyframe(op.packet, op.bytes);
       data[4] = 5;
-      memcpy(data + 5, op.packet, op.bytes);
+      data[5] = (packet_number_ >> 24) & 0xff;
+      data[6] = (packet_number_ >> 16) & 0xff;
+      data[7] = (packet_number_ >> 8) & 0xff;
+      data[8] = (packet_number_) & 0xff;
+      ++packet_number_;
+      memcpy(data + 9, op.packet, op.bytes);
 
       // Synchronously send this back to the main thread for delivery.
       g_platform_api->syncrunonmainthread (WrapTask (
@@ -356,20 +362,11 @@ class DaalaVideoEncoder : public GMPVideoEncoder {
     frame->Destroy();
   }
 
-  uint8_t AveragePlane(uint8_t* ptr, size_t len) {
-    uint64_t val = 0;
-
-    for (size_t i=0; i<len; ++i) {
-      val += ptr[i];
-    }
-
-    return (val / len) % 0xff;
-  }
-
   GMPVideoHost* host_;
   GMPThread* worker_thread_;
   GMPVideoEncoderCallback* callback_;
   ::daala_enc_ctx *enc_ctx_;
+  uint32_t packet_number_;
 };
 
 
@@ -403,7 +400,9 @@ class DaalaVideoDecoder : public GMPVideoDecoder {
     host_ (hostAPI),
     worker_thread_ (NULL),
     callback_ (NULL),
-    dec_ctx_(NULL) {}
+    dec_ctx_(NULL),
+    packet_number_(0) {
+  }
 
   virtual ~DaalaVideoDecoder() {
   }
@@ -496,15 +495,27 @@ class DaalaVideoDecoder : public GMPVideoDecoder {
     GMPLOG (GL_DEBUG, __FUNCTION__ <<" on worker thread length = "
             << inputFrame->Size());
 
-    if (inputFrame->Size() < 5) {
+    if (inputFrame->Size() < 9) {
       GMPLOG(GL_ERROR, "Bogus length");
       return;
     }
 
+    uint32_t pn = 0;
+    pn =  (inputFrame->Buffer()[5] << 24)
+        | (inputFrame->Buffer()[6] << 16)
+        | (inputFrame->Buffer()[7] << 16)
+        | (inputFrame->Buffer()[8]);
+
+    if (pn != packet_number_) {
+      GMPLOG (GL_ERROR, __FUNCTION__ <<" packet gap: saw " << pn
+              << " expected " << packet_number_);
+    }
+    packet_number_ = pn + 1;
+
     ogg_packet op;
     memset(&op, 0, sizeof(op));
-    op.packet = inputFrame->Buffer() + 5;
-    op.bytes = inputFrame->Size() - 5;
+    op.packet = inputFrame->Buffer() + 9;
+    op.bytes = inputFrame->Size() - 9;
 
     od_img img;
     memset(&img, 0, sizeof(img));
@@ -613,6 +624,7 @@ class DaalaVideoDecoder : public GMPVideoDecoder {
   GMPThread* worker_thread_;
   GMPVideoDecoderCallback* callback_;
   ::daala_dec_ctx *dec_ctx_;
+  uint32_t packet_number_;
 };
 
 extern "C" {
