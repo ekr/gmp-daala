@@ -95,18 +95,6 @@ static GMPPlatformAPI* g_platform_api = NULL;
 class DaalaVideoEncoder;
 class DaalaVideoDecoder;
 
-class EncodedFrame {
- public:
-  EncodedFrame() : data(NULL) {}
-  ~EncodedFrame() { delete data; }
-
-  uint32_t width_;
-  uint32_t height_;
-  uint32_t timestamp_;
-  uint8_t* data;
-  size_t len;
-};
-
 static void init_plane(const uint8_t *data,
                        const od_img *img,
                        unsigned char dec,
@@ -117,6 +105,26 @@ static void init_plane(const uint8_t *data,
   plane->xstride = 1;
   plane->ystride = img->width >> dec;
 }
+
+
+/*
+  Packet format:
+
+  uint32  length;
+  uint8   nal_type;
+  uint32  packet_number;
+  uint16  width;
+  uint16  height;
+
+  All numbers are big-endian.
+ */
+
+const size_t kPacketHeaderSize =
+  4 + // length
+  1 + // NAL byte
+  4 + // packet number
+  2 + // width
+  2;  // height
 
 class DaalaVideoEncoder : public GMPVideoEncoder {
  public:
@@ -255,18 +263,31 @@ class DaalaVideoEncoder : public GMPVideoEncoder {
       GMPLOG(GL_DEBUG, "Packet size " << op.bytes);
 
       // TODO(ekr@rtfm.com): Check bytes in-range
-      size_t len = op.bytes + 9;
+      size_t len = op.bytes + kPacketHeaderSize;
       uint8_t* data = new uint8_t[len];
-      uint32_t* lp = reinterpret_cast<uint32_t*>(data);
-      *lp = op.bytes + 5;  // include NAL type
-      // daala_packet_iskeyframe(op.packet, op.bytes);
-      data[4] = 5;
-      data[5] = (packet_number_ >> 24) & 0xff;
-      data[6] = (packet_number_ >> 16) & 0xff;
-      data[7] = (packet_number_ >> 8) & 0xff;
-      data[8] = (packet_number_) & 0xff;
+      uint8_t* ptr = data;
+
+      // Length. Note: platform order.
+      uint32_t* lp = reinterpret_cast<uint32_t*>(ptr);
+      *lp = len-4;
+      ptr+=4;
+
+      // NAL Type.
+      *ptr++ = 5;
+
+      // packet_number.
+      encode_uint(ptr, packet_number_, 4);
+      ptr += 4;
       ++packet_number_;
-      memcpy(data + 9, op.packet, op.bytes);
+
+      // Width and height.
+      encode_uint(ptr, inputImage->Width(), 2);
+      ptr+=2;
+      encode_uint(ptr, inputImage->Height(), 2);
+      ptr+=2;
+
+      // Data.
+      memcpy(ptr, op.packet, op.bytes);
 
       // Synchronously send this back to the main thread for delivery.
       g_platform_api->syncrunonmainthread (WrapTask (
@@ -362,6 +383,14 @@ class DaalaVideoEncoder : public GMPVideoEncoder {
     frame->Destroy();
   }
 
+  void encode_uint(uint8_t* buf, uint64_t val, size_t length) {
+   size_t shift = 8 * (length - 1);
+    for (size_t i=0; i<length; ++i) {
+      buf[i] = (val >> shift) & 0xff;
+      shift -= 8;
+    }
+  }
+
   GMPVideoHost* host_;
   GMPThread* worker_thread_;
   GMPVideoEncoderCallback* callback_;
@@ -421,44 +450,6 @@ class DaalaVideoDecoder : public GMPVideoDecoder {
       return;
     }
 
-    daala_info info;
-    daala_info_init(&info);
-    daala_comment dc;
-    daala_comment_init(&dc);
-    daala_setup_info* ds = NULL;
-    ogg_packet op;
-    int rv;
-
-    memset(&op, 0, sizeof(op));
-    op.packet = kDummyPacket1;
-    op.bytes = sizeof(kDummyPacket1);
-    op.b_o_s = 1;
-    rv = daala_decode_header_in(&info, &dc, &ds, &op);
-    if (rv <= 0) {
-      GMPLOG(GL_ERROR, "Failure reading header packet 1");
-    }
-
-    memset(&op, 0, sizeof(op));
-    op.packet = kDummyPacket2;
-    op.bytes = sizeof(kDummyPacket2);
-    rv = daala_decode_header_in(&info, &dc, &ds, &op);
-    if (rv <= 0) {
-      GMPLOG(GL_ERROR, "Failure reading header packet 2");
-    }
-
-    memset(&op, 0, sizeof(op));
-    op.packet = kDummyPacket3;
-    op.bytes = sizeof(kDummyPacket3);
-    rv = daala_decode_header_in(&info, &dc, &ds, &op);
-    if (rv <= 0) {
-      GMPLOG(GL_ERROR, "Failure reading header packet 3");
-    }
-
-    dec_ctx_ = daala_decode_alloc(&info, ds);
-    if (!dec_ctx_) {
-      GMPLOG(GL_ERROR, "Failure creating Daala ctx");
-    }
-
     callback_ = callback;
   }
 
@@ -494,34 +485,110 @@ class DaalaVideoDecoder : public GMPVideoDecoder {
                  int64_t renderTimeMs = -1) {
     GMPLOG (GL_DEBUG, __FUNCTION__ <<" on worker thread length = "
             << inputFrame->Size());
+    uint8_t* ptr = inputFrame->Buffer();
+    size_t len = inputFrame->Size();
 
-    if (inputFrame->Size() < 9) {
+    if (len < kPacketHeaderSize) {
       GMPLOG(GL_ERROR, "Bogus length");
       return;
     }
 
-    uint32_t pn = 0;
-    pn =  (inputFrame->Buffer()[5] << 24)
-        | (inputFrame->Buffer()[6] << 16)
-        | (inputFrame->Buffer()[7] << 16)
-        | (inputFrame->Buffer()[8]);
+    ptr += 5; len -= 5;  // Skip length and NAL type.
 
+    uint32_t pn = 0;
+    if (!decode_uint(&ptr, &len, &pn)) {
+      GMPLOG (GL_ERROR, __FUNCTION__ <<" decoding error");
+      return;
+    }
     if (pn != packet_number_) {
       GMPLOG (GL_ERROR, __FUNCTION__ <<" packet gap: saw " << pn
               << " expected " << packet_number_);
     }
     packet_number_ = pn + 1;
 
+    uint16_t width;
+    if (!decode_uint(&ptr, &len, &width)) {
+      GMPLOG (GL_ERROR, __FUNCTION__ <<" decoding error");
+      return;
+    }
+
+    uint16_t height;
+    if (!decode_uint(&ptr, &len, &height)) {
+      GMPLOG (GL_ERROR, __FUNCTION__ <<" decoding error");
+      return;
+    }
+
+    if (!dec_ctx_) {
+      GMPLOG(GL_DEBUG, __FUNCTION__ << " setting up with image size"
+             << width
+             << "x"
+             << height);
+
+      // TODO(ekr@rtfm.com): Stop this from trying repeatedly if it
+      // fails the first time.
+      daala_info info;
+      daala_info_init(&info);
+      daala_comment dc;
+      daala_comment_init(&dc);
+      daala_setup_info* ds = NULL;
+      ogg_packet op;
+      int rv;
+
+      // Set up the dummy packet with the right sizes.
+      unsigned char packet1_copy[sizeof(kDummyPacket1)];
+      memcpy(packet1_copy, kDummyPacket1, sizeof(packet1_copy));
+
+      // Encode the width and height
+      encode_uint_little(packet1_copy + 9,
+                         width, 4);
+      encode_uint_little(packet1_copy + 13,
+                         height, 4);
+
+      memset(&op, 0, sizeof(op));
+      op.packet = packet1_copy;
+      op.bytes = sizeof(packet1_copy);
+      op.b_o_s = 1;
+      rv = daala_decode_header_in(&info, &dc, &ds, &op);
+      if (rv <= 0) {
+        GMPLOG(GL_ERROR, "Failure reading header packet 1");
+      }
+
+      memset(&op, 0, sizeof(op));
+      op.packet = kDummyPacket2;
+      op.bytes = sizeof(kDummyPacket2);
+      rv = daala_decode_header_in(&info, &dc, &ds, &op);
+      if (rv <= 0) {
+        GMPLOG(GL_ERROR, "Failure reading header packet 2");
+      }
+
+      memset(&op, 0, sizeof(op));
+      op.packet = kDummyPacket3;
+      op.bytes = sizeof(kDummyPacket3);
+      rv = daala_decode_header_in(&info, &dc, &ds, &op);
+      if (rv <= 0) {
+        GMPLOG(GL_ERROR, "Failure reading header packet 3");
+      }
+
+      dec_ctx_ = daala_decode_alloc(&info, ds);
+      if (!dec_ctx_) {
+        GMPLOG(GL_ERROR, "Failure creating Daala ctx");
+      }
+
+      GMPLOG(GL_DEBUG, __FUNCTION__ << "Setup complete");
+    }
+
+
     ogg_packet op;
     memset(&op, 0, sizeof(op));
-    op.packet = inputFrame->Buffer() + 9;
-    op.bytes = inputFrame->Size() - 9;
+    op.packet = ptr;
+    op.bytes = len;
 
     od_img img;
     memset(&img, 0, sizeof(img));
     int rv = daala_decode_packet_in(dec_ctx_, &img, &op);
     if (rv) {
       GMPLOG(GL_ERROR, "Failure reading data");
+      return;
     }
 
     assert(!(img.width & 1));
@@ -618,6 +685,33 @@ class DaalaVideoDecoder : public GMPVideoDecoder {
     frame->SetDuration (inputFrame->Duration());
     callback_->Decoded (frame);
     inputFrame->Destroy();
+  }
+
+  template <typename T> bool decode_uint(uint8_t** buf, size_t* len, T* v) {
+    size_t size = sizeof(T);
+    T val = 0;
+
+    if (size > (*len))
+      return false;
+
+    for (size_t i=0; i<size; ++i) {
+      val <<= 8;
+      val |= (*buf)[i];
+    }
+
+    *v = val;
+    (*len) -= size;
+    (*buf) += size;
+
+    return true;
+  }
+
+
+  void encode_uint_little(uint8_t* buf, uint64_t val, size_t length) {
+    for (size_t i=0; i<length; ++i) {
+      buf[i] = val & 0xff;
+      val >>= 8;
+    }
   }
 
   GMPVideoHost* host_;
